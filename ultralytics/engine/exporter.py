@@ -577,12 +577,14 @@ class Exporter:
     def export_engine(self, prefix=colorstr('TensorRT:')):
         """YOLOv8 TensorRT export https://developer.nvidia.com/tensorrt."""
         assert self.im.device.type != 'cpu', "export running on CPU but must be on GPU, i.e. use 'device=0'"
+        from ultralytics.utils.trt_utils import ImageBatcher, EngineCalibrator
         try:
             import tensorrt as trt  # noqa
         except ImportError:
             if LINUX:
                 check_requirements('nvidia-tensorrt', cmds='-U --index-url https://pypi.ngc.nvidia.com')
             import tensorrt as trt  # noqa
+
 
         check_version(trt.__version__, '7.0.0', hard=True)  # require tensorrt>=7.0.0
         self.args.simplify = True
@@ -622,10 +624,42 @@ class Exporter:
                 profile.set_shape(inp.name, (1, *shape[1:]), (max(1, shape[0] // 2), *shape[1:]), shape)
             config.add_optimization_profile(profile)
 
-        LOGGER.info(
-            f'{prefix} building FP{16 if builder.platform_has_fast_fp16 and self.args.half else 32} engine as {f}')
+        assert not (self.args.int8 and self.args.half), 'INT8 and FP16 export are not compatible'
+
+        precision="FP32"
+        if self.args.int8:
+            assert builder.platform_has_fast_int8, 'INT8 not supported on this platform'
+            precision="INT8"
+            calib_input = self.args.int8_calibration_input
+            config.set_flag(trt.BuilderFlag.INT8)
+            # Check if calibration input is a directory or a file. If file is is the cache file
+            # If directory, use the ImageBatcher to load the images and save the cache file there
+            if os.path.isfile(calib_input):
+                config.int8_calibrator = EngineCalibrator(calib_input)
+            else:
+                cache_file = os.path.join(calib_input, "calibration_cache.bin")
+                config.int8_calibrator = EngineCalibrator(cache_file)
+                calibration_batch_size = 4 # TODO: what is the best value here?
+                calibration_num_images = len(os.listdir(calib_input))
+                # Shape and dtype taken from the first input
+                calib_shape = [calibration_batch_size] + list(inputs[0].shape[1:])
+                calib_dtype = trt.nptype(inputs[0].dtype)
+                config.int8_calibrator.set_image_batcher(
+                    ImageBatcher(
+                        calib_input,
+                        calib_shape,
+                        calib_dtype,
+                        max_num_images=calibration_num_images,
+                        exact_batches=True,
+                        shuffle_files=True,
+                    )
+            )
+
         if builder.platform_has_fast_fp16 and self.args.half:
             config.set_flag(trt.BuilderFlag.FP16)
+            precision="FP16"
+
+        LOGGER.info(f'{prefix} building {precision} engine as {f}')
 
         del self.model
         torch.cuda.empty_cache()
